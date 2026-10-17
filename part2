@@ -1,0 +1,136 @@
+
+#include <stdint.h>
+
+
+#if !defined(__SOFT_FP__) && defined(__ARM_FP)
+  #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
+#endif
+
+#define RCC_ADDR 0x40021000
+#define RCC_CR_OFFSET 0x00
+#define RCC_CFGR_OFFSET 0x08
+#define TIM4_ADDR 0x40000800
+#define RCC_APB1ENR1_OFFSET 0x58
+#define TIM4_PSC_OFFSET 0x28
+#define TIM4_ARR_OFFSET 0x2C
+#define TIM4_DIER_OFFSET 0x0C // BIT 0: update interrupt enable
+#define TIM4_EGR_OFFSET 0x14 // BIT 0: update generation, 1 = reinitialize counter and updates registers
+#define TIM4_CR1_OFFSET 0x00 // BIT 0: counter enable
+#define TIM4_SR_OFFSET 0x10 // BIT 0: updates interrupt flag
+#define NVIC_ISER0_ADDR 0xE000E100
+#define GPIOB_ODR_ADDR 0x48000414
+
+#define GREEN 1 << 7
+#define BLUE 1 << 7
+#define RED 1 << 14
+
+
+// order of events: set up clock source, enable tim4's clock and configure it, enamble irq in nvic,
+// write the isr, configure led gpios
+// in RCC, enable the HSI16 clock
+
+void TIM4_IRQHandler(void) {
+	// what to do when interrupt fires
+	volatile uint32_t *tim4_sr = (volatile uint32_t *)(TIM4_ADDR + TIM4_SR_OFFSET);
+	*tim4_sr &= ~(1 << 0); // clear update interrupt flag
+
+	// blink led somehow
+	static uint32_t color = 0; // starts at green; retained between interrupts
+
+	// Turn off the current LED.
+	*(volatile uint32_t *)0x48000814 &= ~(1U << 7);
+	*(volatile uint32_t *)GPIOB_ODR_ADDR &= ~((1U << 7) | (1U << 14));
+
+	color = (color + 1) % 3;
+
+	if (color == 0) {
+	    *(volatile uint32_t *)0x48000814 |= (1U << 7); // green
+	} else if (color == 1) {
+	    *(volatile uint32_t *)GPIOB_ODR_ADDR |= (1U << 7); // blue
+	} else {
+	    *(volatile uint32_t *)GPIOB_ODR_ADDR |= (1U << 14); // red
+	}
+}
+
+
+
+int main(void)
+{
+	// ENABLE HSI16 AND WAIT UNTIL READY
+	volatile uint32_t *rcc_cr = (volatile uint32_t *)(RCC_ADDR + RCC_CR_OFFSET);
+	*rcc_cr |= (1 << 8); // enable hsi16 is bit 8
+	while ((*rcc_cr & (1 << 10)) == 0); //wait until ready, bit 10 is ready bit
+
+	// SELECT HSI16 AS SYSCLK
+	volatile uint32_t *rcc_cfgr = (volatile uint32_t *)(RCC_ADDR + RCC_CFGR_OFFSET);
+	*rcc_cfgr &= ~(0x3 << 0); // clear both bits 00
+	*rcc_cfgr |= (0x1 << 0); // setting field to 01 since that is the hsi16
+	// sws is at bits [3:2] so i need to mask right
+	while ((*rcc_cfgr & (0x3 << 2)) != (0x1 << 2)); // 0x3 << 2= 0b1100. keep looping until sws field is 01
+
+	//ENABLE GPIOB AND GPIOC CLOCKS
+	volatile uint32_t *rcc_apb1enr1 = (volatile uint32_t *)(RCC_ADDR + RCC_APB1ENR1_OFFSET);
+	*rcc_apb1enr1 |= (1 << 2); // enable tim4 clock, bit 2
+
+
+	// configure gpio for blue led, copy from lab 1
+	volatile uint32_t *rcc_ahb2enr = (volatile uint32_t*) 0x4002104C;
+	uint32_t cur_value = *rcc_ahb2enr;
+	cur_value = cur_value | 0x00000002;
+	cur_value = cur_value | 0x00000004;
+	*rcc_ahb2enr = cur_value;
+	volatile uint32_t *gpiob_moder = (volatile uint32_t *)0x48000400;
+	volatile uint32_t *gpioc_moder = (volatile uint32_t *)0x48000800;
+	uint32_t mode;
+	// PB7 is controlled by bits 14 and 15
+	// clear them and set to 01
+	mode = *gpiob_moder;
+	mode = mode & ~0x0000C000; // clears
+	mode = mode | 0x00004000; // sets bit 14 to 1
+	*gpiob_moder = mode;
+
+	// PB14 is controlled by bits 28 and 29
+	mode = *gpiob_moder;
+	mode = mode & ~0x30000000; // clears
+	mode = mode | 0x10000000; // sets bit 28 to 1
+	*gpiob_moder = mode;
+
+
+	// PC7 is controlled by bits 14 and 15
+	mode = *gpioc_moder;
+	mode = mode & ~0x0000C000; // clears
+	mode = mode | 0x00004000; // sets bit 14 to 1
+	*gpioc_moder = mode;
+
+	// Start at green, with blue and red off.
+	*(volatile uint32_t *)GPIOB_ODR_ADDR &= ~((1 << 7) | (1 << 14));
+	*(volatile uint32_t *)0x48000814 |= (1 << 7);
+
+
+
+	//time = (psc + 1) / f_timer x (ARR +1)
+	// (psc + 1)(arr + 1) = f_timer X time = 16M x 1
+	volatile uint32_t *tim4_psc = (volatile uint32_t *)(TIM4_ADDR + TIM4_PSC_OFFSET);
+	*tim4_psc = 15999;
+
+	volatile uint32_t *tim4_arr = (volatile uint32_t *)(TIM4_ADDR + TIM4_ARR_OFFSET);
+	*tim4_arr = 999;
+
+	volatile uint32_t *tim4_egr = (volatile uint32_t *)(TIM4_ADDR + TIM4_EGR_OFFSET);
+	*tim4_egr |= (1 << 0); // enable bit 0, update generation
+	volatile uint32_t *tim4_sr = (volatile uint32_t *)(TIM4_ADDR + TIM4_SR_OFFSET);
+	*tim4_sr &= ~(1 << 0); // clear update interrupt flag
+	volatile uint32_t *tim4_dier = (volatile uint32_t *)(TIM4_ADDR + TIM4_DIER_OFFSET);
+	*tim4_dier |= (1 << 0); // enable update interrupt
+	volatile uint32_t *tim4_cr1 = (volatile uint32_t *)(TIM4_ADDR + TIM4_CR1_OFFSET);
+	*tim4_cr1 |= (1 << 0); // start counter
+
+
+	volatile uint32_t *nvic_iser0 = (volatile uint32_t *)NVIC_ISER0_ADDR;
+	*nvic_iser0 |= (1 << 30); // enable irq 30 (tim4)
+
+
+
+	while(1) {}
+
+}
